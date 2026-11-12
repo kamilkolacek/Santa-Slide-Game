@@ -1,0 +1,1281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#1c2a66">
+<title>Santa's Slide</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#1c2a66;overscroll-behavior:none;
+    -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;touch-action:none}
+  canvas{position:fixed;left:0;top:0;width:100%;height:100%;display:block;touch-action:none}
+  /* Parent menu: only reachable by a long-press in the top-left corner */
+  #parent{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    background:rgba(10,16,48,.72);z-index:10;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  #parent[hidden]{display:none}
+  #parent .card{background:#fff;border-radius:22px;padding:26px 30px;width:min(360px,86vw);box-shadow:0 20px 60px rgba(0,0,0,.4)}
+  #parent h1{margin:0 0 4px;font-size:22px;color:#1c2a66}
+  #parent p{margin:0 0 16px;font-size:14px;color:#566}
+  #parent button{display:block;width:100%;margin:8px 0;padding:14px;font-size:17px;border:0;border-radius:14px;
+    background:#eef2ff;color:#1c2a66;font-weight:600;cursor:pointer;touch-action:manipulation}
+  #parent button.primary{background:#e5303f;color:#fff}
+  #parent button.quiet{background:#f3f3f3;color:#555}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h1>Parent menu</h1>
+    <p>Santa's Slide is paused.</p>
+    <button class="primary" id="pResume">Resume playing</button>
+    <button id="pMusic">Music: on</button>
+    <button id="pSound">Sound effects: on</button>
+    <button id="pFull">Toggle fullscreen</button>
+    <button class="quiet" id="pExit">Exit to start screen</button>
+  </div>
+</div>
+
+<script>
+/* =====================================================================
+   SANTA'S SLIDE  -  a no-fail Christmas toy for a toddler
+   ---------------------------------------------------------------------
+   Single file, no assets. Canvas drawing + Web Audio synthesis.
+   Parent exit: press and hold the TOP-LEFT corner for 1.5 seconds.
+   Dev keys: 1 / 2 / 3 tap the lanes.
+
+   ART SWAP: every character is drawn with vector shapes below. To use
+   real art later, set window.SANTA_ART before this script runs, e.g.
+     window.SANTA_ART = { snowman: imgOrFn, reindeer: imgOrFn, elf: imgOrFn,
+                          santa: imgOrFn, sleigh: imgOrFn };
+   An HTMLImageElement is drawn with its feet-centre at the character's
+   anchor. A function(ctx, pose, time) draws in local coordinates
+   (feet at 0,0, y up is negative).
+   ===================================================================== */
+(() => {
+'use strict';
+
+const CONFIG = {
+  sleighName: '',            // later: e.g. 'Mia' puts her name on the sleigh
+  presentsPerCelebration: 5, // small party every N presents
+  sleighCapacity: 10,        // presents on the sleigh before it flies off
+  parentHoldMs: 1500
+};
+
+/* ---------------------------------------------------------------- helpers */
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+const rand = (a, b) => a + Math.random() * (b - a);
+const pick = a => a[(Math.random() * a.length) | 0];
+const easeOutBack = t => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+
+function rr(c, x, y, w, h, r) {
+  c.beginPath(); c.moveTo(x + r, y);
+  c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath();
+}
+function ell(c, x, y, rx, ry, rot) { c.beginPath(); c.ellipse(x, y, rx, ry, rot || 0, 0, TAU); }
+function circ(c, x, y, r) { c.beginPath(); c.arc(x, y, r, 0, TAU); }
+function starPath(c, x, y, R, r, n, rot) {
+  n = n || 5; rot = rot === undefined ? -Math.PI / 2 : rot;
+  c.beginPath();
+  for (let i = 0; i < n * 2; i++) {
+    const a = rot + i * Math.PI / n, rad = i % 2 ? r : R;
+    c.lineTo(x + Math.cos(a) * rad, y + Math.sin(a) * rad);
+  }
+  c.closePath();
+}
+function heartPath(c, x, y, s) {
+  c.beginPath(); c.moveTo(x, y + s * 0.5);
+  c.bezierCurveTo(x - s, y - s * 0.1, x - s * 0.5, y - s * 0.9, x, y - s * 0.35);
+  c.bezierCurveTo(x + s * 0.5, y - s * 0.9, x + s, y - s * 0.1, x, y + s * 0.5);
+  c.closePath();
+}
+
+/* ------------------------------------------------------------ world layout */
+const VW = 1600, VH = 900;                    // virtual canvas, scaled to fit
+const LANES = [
+  { kind: 'snowman', topX: 310, botX: 225,  color: '#5ec8ff', dark: '#2c93d6' },
+  { kind: 'reindeer', topX: 620, botX: 600,  color: '#ffa24d', dark: '#d9731b' },
+  { kind: 'elf',      topX: 940, botX: 1000, color: '#57d675', dark: '#2fa04f' }
+];
+const Y_TOP = 345, Y_BOT = 745, HW_TOP = 105, HW_BOT = 150;
+const FEET_Y = 872, MOUTH_Y = FEET_Y - 150;
+const SANTA_DX = -105, SACK_DX = 105;
+const SLEIGH_HOME = { x: 1385, y: 832 };
+const WRAP = 0.6, SLIDE_DUR = 2.3, DROP_DUR = 0.34, CHEER = 1.2, HOP_DUR = 0.5, MAX_INFLIGHT = 6;
+
+const laneXAt = (i, y) => { const L = LANES[i]; return lerp(L.topX, L.botX, (y - Y_TOP) / (Y_BOT - Y_TOP)); };
+const santaXFor = i => LANES[i].botX + SANTA_DX;
+
+/* ------------------------------------------------------------------ canvas */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let W = 0, H = 0, dpr = 1, S = 1, offX = 0, offY = 0, ext = { l: 0, r: VW, t: 0, b: VH };
+function resize() {
+  W = window.innerWidth; H = window.innerHeight;
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  S = Math.min(W / VW, H / VH);
+  offX = (W - VW * S) / 2; offY = (H - VH * S) / 2;
+  ext = { l: -offX / S, r: VW + offX / S, t: -offY / S, b: VH + offY / S };
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 200));
+resize();
+const toVirtual = (cx, cy) => ({ x: (cx - offX) / S, y: (cy - offY) / S });
+const screenTransform = () => ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+const gameTransform = () => ctx.setTransform(dpr * S, 0, 0, dpr * S, dpr * offX, dpr * offY);
+
+/* ------------------------------------------------------------------- AUDIO */
+const A = {
+  ctx: null, master: null, sfx: null, mus: null, noise: null, musicOn: true, sfxOn: true,
+  init() {
+    if (this.ctx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const c = this.ctx = new AC();
+    const comp = c.createDynamicsCompressor();
+    comp.threshold.value = -16; comp.ratio.value = 4; comp.attack.value = 0.005; comp.release.value = 0.2;
+    this.master = c.createGain(); this.master.gain.value = 0.9;
+    this.sfx = c.createGain(); this.sfx.gain.value = this.sfxOn ? 0.6 : 0;
+    this.mus = c.createGain(); this.mus.gain.value = this.musicOn ? 0.17 : 0;
+    this.sfx.connect(this.master); this.mus.connect(this.master);
+    this.master.connect(comp); comp.connect(c.destination);
+    const len = c.sampleRate;
+    this.noise = c.createBuffer(1, len, c.sampleRate);
+    const d = this.noise.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  },
+  resume() { if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume(); },
+  now(delay) { return this.ctx.currentTime + 0.01 + (delay || 0); },
+  ok() { return !!this.ctx && this.sfxOn; },
+  setMusic(on) { this.musicOn = on; if (this.mus) this.mus.gain.setTargetAtTime(on ? 0.17 : 0, this.ctx.currentTime, 0.05); },
+  setSfx(on) { this.sfxOn = on; if (this.sfx) this.sfx.gain.setTargetAtTime(on ? 0.6 : 0, this.ctx.currentTime, 0.05); }
+};
+
+function tone(o) {
+  const c = A.ctx, t = o.t, osc = c.createOscillator(), g = c.createGain();
+  osc.type = o.type || 'sine';
+  osc.frequency.setValueAtTime(o.f, t);
+  if (o.f2) osc.frequency.exponentialRampToValueAtTime(o.f2, t + o.dur);
+  const vol = o.vol === undefined ? 0.3 : o.vol, att = o.att || 0.008;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + att);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + o.dur);
+  let last = osc;
+  if (o.lp) { const f = c.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = o.lp; osc.connect(f); last = f; }
+  last.connect(g); g.connect(o.dest || A.sfx);
+  if (o.vib) {
+    const l = c.createOscillator(), lg = c.createGain();
+    l.frequency.value = o.vib[0]; lg.gain.value = o.vib[1];
+    l.connect(lg); lg.connect(osc.frequency); l.start(t); l.stop(t + o.dur + 0.05);
+  }
+  osc.start(t); osc.stop(t + o.dur + 0.05);
+}
+function noiseBurst(t, dur, o) {
+  o = o || {};
+  const c = A.ctx, src = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+  src.buffer = A.noise; src.loop = true;
+  f.type = o.type || 'bandpass'; f.Q.value = o.q || 1;
+  f.frequency.setValueAtTime(o.f || 2000, t);
+  if (o.f1) f.frequency.exponentialRampToValueAtTime(o.f1, t + dur);
+  const vol = o.vol || 0.1, att = o.att || 0.005;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + att);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(f); f.connect(g); g.connect(o.dest || A.sfx);
+  src.start(t, Math.random() * 0.5); src.stop(t + dur + 0.05);
+}
+function bell(t, f, vol, dur) {
+  dur = dur || 1.2;
+  const parts = [[1, 1, 1], [2.0, 0.45, 0.6], [2.76, 0.33, 0.45], [5.4, 0.18, 0.28]];
+  for (const [r, a, d] of parts) tone({ t, f: f * r, dur: dur * d, vol: vol * a, att: 0.003 });
+}
+const PENT = [1046.5, 1174.7, 1318.5, 1568, 1760, 2093];
+
+/* "Ho ho ho!" - sawtooth through two vowel formants, with a breathy start */
+function hoho(t, n) {
+  const c = A.ctx;
+  for (let i = 0; i < n; i++) {
+    const t0 = t + i * 0.27, f0 = 148 - i * 9;
+    const osc = c.createOscillator(); osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(f0 * 1.28, t0);
+    osc.frequency.exponentialRampToValueAtTime(f0 * 0.84, t0 + 0.22);
+    const l = c.createOscillator(), lg = c.createGain();
+    l.frequency.value = 6; lg.gain.value = 3; l.connect(lg); lg.connect(osc.frequency);
+    const f1 = c.createBiquadFilter(), f2 = c.createBiquadFilter();
+    f1.type = 'bandpass'; f1.frequency.value = 520; f1.Q.value = 3.5;
+    f2.type = 'bandpass'; f2.frequency.value = 940; f2.Q.value = 4;
+    const g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.95, t0 + 0.035);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.25);
+    osc.connect(f1); osc.connect(f2); f1.connect(g); f2.connect(g); g.connect(A.sfx);
+    tone({ t: t0, f: f0 * 1.1, f2: f0 * 0.85, dur: 0.22, vol: 0.12, att: 0.03 });
+    noiseBurst(t0, 0.06, { type: 'highpass', f: 1800, vol: 0.04 });
+    osc.start(t0); osc.stop(t0 + 0.3); l.start(t0); l.stop(t0 + 0.3);
+  }
+}
+
+const SND = {
+  tap() { if (!A.ok()) return; const t = A.now(); tone({ t, f: 520, f2: 900, dur: 0.1, vol: 0.2 }); },
+  boingSmall() { if (!A.ok()) return; const t = A.now(); tone({ t, f: 300, f2: 520, dur: 0.16, vol: 0.18, vib: [20, 30] }); },
+  wrap() {
+    if (!A.ok()) return; const t = A.now();
+    [1, 1.25, 1.5, 2].forEach((m, i) => bell(t + i * 0.09, 784 * m, 0.11, 0.5));
+    noiseBurst(t, 0.45, { type: 'bandpass', f: 3500, f1: 7000, q: 2, vol: 0.04, att: 0.1 });
+  },
+  slide() {
+    if (!A.ok()) return; const t = A.now();
+    tone({ t, f: 1000, f2: 380, dur: 1.9, vol: 0.07, att: 0.25, vib: [6, 22] });
+    tone({ t: t + 0.02, f: 1500, f2: 570, dur: 1.9, vol: 0.025, att: 0.25, vib: [6, 30] });
+  },
+  hop() {
+    if (!A.ok()) return; const t = A.now();
+    tone({ t, f: 180, f2: 420, dur: 0.18, vol: 0.28, vib: [16, 25] });
+    tone({ t: t + 0.05, f: 360, dur: 0.3, vol: 0.1, vib: [26, 70], type: 'triangle' });
+  },
+  land() { if (!A.ok()) return; const t = A.now(); tone({ t, f: 190, f2: 90, dur: 0.12, vol: 0.2 }); },
+  catch(delay) {
+    if (!A.ok()) return; const t = A.now(delay);
+    tone({ t, f: 440, f2: 110, dur: 0.15, vol: 0.34 });
+    noiseBurst(t, 0.07, { type: 'lowpass', f: 900, vol: 0.14 });
+    bell(t + 0.05, pick([1319, 1568, 1760]), 0.12, 0.8);
+  },
+  ho(n) { if (!A.ok()) return; hoho(A.now(0.06), n); },
+  cheer(kind, delay) {
+    if (!A.ok()) return; const t = A.now(delay);
+    if (kind === 'snowman') {            // "woo-hoo!"
+      tone({ t, f: 330, f2: 520, dur: 0.2, vol: 0.2, type: 'triangle', vib: [8, 8], lp: 1800 });
+      tone({ t: t + 0.2, f: 520, f2: 760, dur: 0.26, vol: 0.2, type: 'triangle', vib: [8, 10], lp: 1800 });
+    } else if (kind === 'reindeer') {    // jingle shake + happy whinny
+      for (let i = 0; i < 6; i++) bell(t + i * 0.045, rand(2200, 3400), 0.05, 0.35);
+      tone({ t: t + 0.05, f: 520, f2: 880, dur: 0.18, vol: 0.14, type: 'sawtooth', lp: 1300, vib: [14, 20] });
+      tone({ t: t + 0.23, f: 880, f2: 480, dur: 0.22, vol: 0.14, type: 'sawtooth', lp: 1300, vib: [14, 20] });
+    } else {                             // elf giggle
+      for (let i = 0; i < 5; i++) tone({ t: t + i * 0.075, f: 1000 + (i % 2) * 280 + i * 30, dur: 0.06, vol: 0.12, type: 'triangle' });
+    }
+  },
+  celebrate() {
+    if (!A.ok()) return; const t = A.now();
+    for (let i = 0; i < 12; i++) bell(t + i * 0.07 + rand(0, 0.03), pick(PENT), 0.08, 0.9);
+    [523.25, 659.25, 783.99, 1046.5, 1318.5].forEach((f, i) => bell(t + 0.1 + i * 0.11, f, 0.15, 1.4));
+    noiseBurst(t, 1.5, { type: 'lowpass', f: 3200, f1: 700, q: 0.7, vol: 0.07, att: 0.25 });
+  },
+  sleighBells() {
+    if (!A.ok()) return; const t = A.now();
+    for (let i = 0; i < 7; i++) bell(t + i * 0.06, rand(1800, 3000), 0.07, 0.5);
+  },
+  sleighLand() {
+    if (!A.ok()) return; const t = A.now();
+    for (let i = 0; i < 5; i++) bell(t + i * 0.08, pick(PENT), 0.09, 0.9);
+    tone({ t, f: 160, f2: 70, dur: 0.2, vol: 0.2 });
+  },
+  takeoff() {
+    if (!A.ok()) return; const t = A.now();
+    tone({ t, f: 260, f2: 900, dur: 2.6, vol: 0.05, att: 0.3, vib: [5, 20] });
+    for (let i = 0; i < 24; i++) bell(t + i * 0.11 + rand(0, 0.04), pick(PENT), 0.06, 0.8);
+    noiseBurst(t, 2.6, { type: 'bandpass', f: 1200, f1: 3000, q: 0.8, vol: 0.05, att: 0.4 });
+  },
+  fanfare() {
+    if (!A.ok()) return; const t = A.now();
+    [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => bell(t + i * 0.12, f, 0.16, 1.3));
+    hoho(t + 0.5, 3);
+  }
+};
+
+/* ---- Music: public-domain carols (Jingle Bells 1857, We Wish You a Merry
+   Christmas - traditional, Silent Night 1818) played on a synth music box.
+   Notes are written by hand here; there are no recordings. ---- */
+const NOTE_IDX = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+function midiFreq(name) {
+  const m = /^([A-G])(#|b)?(\d)$/.exec(name);
+  let n = NOTE_IDX[m[1]] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0) + (parseInt(m[3], 10) + 1) * 12;
+  return 440 * Math.pow(2, (n - 69) / 12);
+}
+function parseTune(str, spb, sustain) {
+  const notes = str.trim().split(/\s+/).filter(s => s !== '|').map(tok => {
+    const [n, b] = tok.split(':');
+    return { f: n === 'R' ? 0 : midiFreq(n), beats: parseFloat(b) };
+  });
+  return { notes, spb, sustain: sustain || 1 };
+}
+const JB1 = 'E4:1 E4:1 E4:2 | E4:1 E4:1 E4:2 | E4:1 G4:1 C4:1.5 D4:.5 | E4:4 |';
+const JB2 = 'F4:1 F4:1 F4:1.5 F4:.5 | F4:1 E4:1 E4:1 E4:.5 E4:.5 |';
+const TUNES = [
+  parseTune(JB1 + ' ' + JB2 + ' E4:1 D4:1 D4:1 E4:1 | D4:2 G4:2 | ' + JB1 + ' ' + JB2 + ' G4:1 G4:1 F4:1 D4:1 | C4:4', 0.4),
+  parseTune('D4:1 | G4:1 G4:.5 A4:.5 G4:.5 F#4:.5 | E4:1 E4:1 E4:1 | A4:1 A4:.5 B4:.5 A4:.5 G4:.5 | F#4:1 D4:1 D4:1 | ' +
+            'B4:1 B4:.5 C5:.5 B4:.5 A4:.5 | G4:1 E4:1 D4:.5 D4:.5 | E4:1 A4:1 F#4:1 | G4:3 | R:1 ' +
+            'D4:1 | G4:1 G4:.5 A4:.5 G4:.5 F#4:.5 | E4:1 E4:1 E4:1 | A4:1 A4:.5 B4:.5 A4:.5 G4:.5 | F#4:1 D4:1 D4:1 | ' +
+            'B4:1 B4:.5 C5:.5 B4:.5 A4:.5 | G4:1 E4:1 D4:.5 D4:.5 | E4:1 A4:1 F#4:1 | G4:3', 0.38),
+  parseTune('G4:1.5 A4:.5 G4:1 | E4:3 | G4:1.5 A4:.5 G4:1 | E4:3 | D5:2 D5:1 | B4:3 | C5:2 C5:1 | G4:3 | ' +
+            'A4:2 A4:1 | C5:1.5 B4:.5 A4:1 | G4:1.5 A4:.5 G4:1 | E4:3 | A4:2 A4:1 | C5:1.5 B4:.5 A4:1 | G4:1.5 A4:.5 G4:1 | E4:3 | ' +
+            'D5:2 D5:1 | F5:1.5 D5:.5 B4:1 | C5:3 | E5:3 | C5:1.5 G4:.5 E4:1 | G4:1.5 F4:.5 D4:1 | C4:3', 0.5, 1.5)
+];
+function musicBoxNote(t, f, dur, sus) {
+  const d = clamp(dur * 1.3 * sus, 0.4, 1.8);
+  tone({ t, f, dur: d, vol: 0.5, att: 0.004, dest: A.mus });
+  tone({ t, f: f * 2, dur: d * 0.55, vol: 0.14, att: 0.004, dest: A.mus });
+  tone({ t, f: f * 4, dur: 0.16, vol: 0.07, att: 0.002, dest: A.mus });
+}
+const Music = {
+  idx: 0, step: 0, next: 0, timer: null,
+  start() {
+    if (!A.ctx || this.timer) return;
+    this.next = A.ctx.currentTime + 0.4;
+    this.timer = setInterval(() => this.tick(), 100);
+  },
+  stop() { if (this.timer) { clearInterval(this.timer); this.timer = null; } },
+  tick() {
+    const c = A.ctx; if (!c || c.state !== 'running') return;
+    while (this.next < c.currentTime + 0.5) {
+      const tune = TUNES[this.idx], n = tune.notes[this.step], dur = n.beats * tune.spb;
+      if (n.f) musicBoxNote(this.next, n.f, dur, tune.sustain);
+      this.next += dur; this.step++;
+      if (this.step >= tune.notes.length) { this.step = 0; this.idx = (this.idx + 1) % TUNES.length; this.next += 1.4; }
+    }
+  }
+};
+
+/* ------------------------------------------------------------ game state */
+let state = 'title';          // 'title' | 'play'
+let paused = false;
+let time = 0, lastTap = 0, totalCaught = 0, garlandBoost = 0, tapPulse = 0;
+const presents = [], particles = [], flyers = [], timers = [];
+const helpers = LANES.map((L, i) => ({ i, kind: L.kind, wrapT: -1, tossT: -1, cheerT: -1, boing: 0, cool: 0,
+  phase: i * 1.7, blink: 0, nextBlink: rand(2, 5), current: null }));
+const santa = { lane: 1, x: santaXFor(1), hop: null, squash: 0, busy: 0, rot: 0, hoT: -1, sackN: 0, peek: [],
+  blink: 0, nextBlink: 3, voiceUntil: 0, wave: 0, jump: 0 };
+const sleigh = { pile: [], incoming: 0, bounce: 0, flying: false, flyT: 0, takeoffPending: false, bellT: 0 };
+const stars = Array.from({ length: 140 }, () => ({ x: rand(-700, 2300), y: rand(-500, 560), r: rand(1, 3), ph: rand(0, TAU) }));
+const flakes = Array.from({ length: 70 }, () => ({ x: Math.random(), y: Math.random(), r: rand(1.5, 4.5), v: rand(0.02, 0.06), ph: rand(0, TAU) }));
+
+function later(fn, delay) { timers.push({ t: delay, fn }); }
+
+/* ------------------------------------------------------- present specs */
+const PALETTE = [
+  { base: '#ff4d6a', dark: '#c92b4a', rib: '#ffe27a' },
+  { base: '#3ecf74', dark: '#1f9d52', rib: '#fff1b8' },
+  { base: '#4aa8ff', dark: '#2677d4', rib: '#ffe27a' },
+  { base: '#ffd23f', dark: '#e0a100', rib: '#ff5d73' },
+  { base: '#b472ff', dark: '#8647d8', rib: '#8ff0ff' },
+  { base: '#ff8fcf', dark: '#dd5aa6', rib: '#ffffff' },
+  { base: '#ff9a3c', dark: '#e06f12', rib: '#4aa8ff' }
+];
+const SHAPES = ['box', 'tall', 'wide', 'lid', 'flat'];
+const PATTERNS = ['plain', 'dots', 'stripes'];
+let lastShape = -1, lastCol = -1;
+function newSpec() {
+  let s, c;
+  do { s = (Math.random() * SHAPES.length) | 0; } while (s === lastShape);
+  do { c = (Math.random() * PALETTE.length) | 0; } while (c === lastCol);
+  lastShape = s; lastCol = c;
+  return { shape: SHAPES[s], col: PALETTE[c], pattern: pick(PATTERNS) };
+}
+function bow(c, x, y, s, col) {
+  c.fillStyle = col.rib; c.strokeStyle = 'rgba(0,0,0,.2)'; c.lineWidth = s * 0.02;
+  for (const d of [-1, 1]) { ell(c, x + d * s * 0.17, y - s * 0.08, s * 0.17, s * 0.1, -d * 0.5); c.fill(); c.stroke(); }
+  circ(c, x, y - s * 0.03, s * 0.075); c.fill(); c.stroke();
+}
+function drawPresent(c, spec, s) {
+  // every present is a wrapped gift box: different proportions, patterns and ribbons
+  const col = spec.col, sh = spec.shape;
+  c.lineJoin = 'round'; c.lineCap = 'round';
+  const w = sh === 'tall' ? s * 0.78 : sh === 'wide' ? s * 1.25 : sh === 'flat' ? s * 1.4 : s;
+  const h = sh === 'tall' ? s * 1.15 : sh === 'wide' ? s * 0.78 : sh === 'flat' ? s * 0.6 : s * 0.95;
+  rr(c, -w / 2, -h / 2, w, h, s * 0.12); c.fillStyle = col.base; c.fill();
+  c.lineWidth = s * 0.05; c.strokeStyle = col.dark; c.stroke();
+  if (spec.pattern === 'dots') {
+    c.fillStyle = 'rgba(255,255,255,.5)';
+    for (const d of [[-.3, -.26], [.26, -.3], [-.22, .3], [.32, .2], [0, -.02]]) { circ(c, d[0] * w, d[1] * h, s * 0.05); c.fill(); }
+  } else if (spec.pattern === 'stripes') {
+    c.save(); rr(c, -w / 2, -h / 2, w, h, s * 0.12); c.clip(); c.fillStyle = 'rgba(255,255,255,.28)';
+    for (let x = -w; x < w; x += s * 0.28) c.fillRect(x, -h, s * 0.12, h * 2);
+    c.restore();
+  }
+  c.fillStyle = col.rib; c.fillRect(-s * 0.07, -h / 2, s * 0.14, h);
+  if (sh !== 'flat') c.fillRect(-w / 2, -s * 0.07, w, s * 0.14);
+  if (sh === 'lid') {            // box with a separate lid
+    rr(c, -w / 2 - s * 0.05, -h / 2 - s * 0.02, w + s * 0.1, s * 0.26, s * 0.08); c.fillStyle = col.dark; c.fill();
+    c.fillStyle = col.rib; c.fillRect(-s * 0.07, -h / 2 - s * 0.02, s * 0.14, s * 0.26);
+  }
+  c.fillStyle = 'rgba(255,255,255,.3)'; rr(c, -w / 2 + s * 0.07, -h / 2 + s * 0.3, w * 0.3, s * 0.06, s * 0.03); c.fill();
+  bow(c, 0, -h / 2 - (sh === 'lid' ? s * 0.02 : 0), s, col);
+}
+
+/* ------------------------------------------------------------ particles */
+function P(type, x, y, o) {
+  if (particles.length > 800) return;
+  particles.push(Object.assign({ type, x, y, vx: 0, vy: 0, grav: 0, drag: 0, t: 0, life: 1, size: 10, col: '#fff', rot: 0, spin: 0, a: 1 }, o));
+}
+function sparkBurst(x, y, n, cols, speed, size, life) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, TAU), v = rand(speed * 0.4, speed);
+    P('spark', x, y, { vx: Math.cos(a) * v, vy: Math.sin(a) * v, grav: 120, drag: 1.5, life: rand(life * 0.7, life * 1.2),
+      size: rand(size * 0.6, size), col: pick(cols), rot: rand(0, TAU), spin: rand(-3, 3) });
+  }
+}
+function ringFx(x, y, col, size, life) { P('ring', x, y, { size, life, col }); }
+function heartFx(x, y) { P('heart', x, y, { vx: rand(-40, 40), vy: rand(-140, -80), life: rand(0.9, 1.4), size: rand(14, 22), col: pick(['#ff6b8b', '#ff4d6a', '#ffa3bd']), drag: 0.6 }); }
+function snowBurst(n) {
+  for (let i = 0; i < n; i++) {
+    P('snow', rand(ext.l, ext.r), ext.t - rand(20, 500), { vx: rand(-40, 40), vy: rand(150, 330), life: rand(3.0, 4.6),
+      size: rand(4, 11), spin: rand(0, TAU) });
+  }
+}
+function confettiFx(x, y, n) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(-Math.PI, 0), v = rand(200, 520);
+    P('confetti', x, y, { vx: Math.cos(a) * v, vy: Math.sin(a) * v, grav: 520, drag: 0.6, life: rand(1.4, 2.4), size: rand(8, 14),
+      col: pick(PALETTE).base, rot: rand(0, TAU), spin: rand(-8, 8) });
+  }
+}
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.t += dt;
+    if (p.t >= p.life) { particles[i] = particles[particles.length - 1]; particles.pop(); continue; }
+    p.vy += p.grav * dt;
+    if (p.drag) { const k = Math.max(0, 1 - p.drag * dt); p.vx *= k; if (p.type !== 'snow') p.vy *= k; }
+    p.x += p.vx * dt; p.y += p.vy * dt; p.rot += p.spin * dt;
+    if (p.type === 'snow') p.x += Math.sin(time * 1.5 + p.spin) * 22 * dt;
+  }
+}
+function drawParticles() {
+  for (const p of particles) {
+    const u = p.t / p.life;
+    let a = u < 0.1 ? u / 0.1 : 1 - (u - 0.1) / 0.9;
+    if (p.type === 'snow') a = u > 0.85 ? (1 - u) / 0.15 : 0.95;
+    ctx.save(); ctx.globalAlpha = clamp(a, 0, 1) * p.a; ctx.translate(p.x, p.y);
+    switch (p.type) {
+      case 'spark': {
+        const tw = 0.75 + 0.25 * Math.sin(p.t * 18 + p.rot);
+        const r = p.size * (1 - 0.4 * u) * tw;
+        ctx.rotate(p.rot);
+        ctx.globalAlpha *= 0.28; ctx.fillStyle = p.col; circ(ctx, 0, 0, r * 1.5); ctx.fill();
+        ctx.globalAlpha /= 0.28; starPath(ctx, 0, 0, r, r * 0.4, 4, 0); ctx.fillStyle = p.col; ctx.fill();
+        ctx.fillStyle = '#fff'; ctx.globalAlpha *= 0.8; starPath(ctx, 0, 0, r * 0.5, r * 0.2, 4, 0); ctx.fill();
+        break;
+      }
+      case 'snow': ctx.fillStyle = '#fff'; circ(ctx, 0, 0, p.size); ctx.fill(); break;
+      case 'confetti': ctx.rotate(p.rot); ctx.scale(1, Math.abs(Math.cos(p.rot * 1.3)) * 0.8 + 0.2);
+        ctx.fillStyle = p.col; ctx.fillRect(-p.size / 2, -p.size / 4, p.size, p.size / 2); break;
+      case 'ring': {
+        const r = lerp(p.size * 0.15, p.size, 1 - Math.pow(1 - u, 3));
+        ctx.strokeStyle = p.col; ctx.lineWidth = 7 * (1 - u) + 1; circ(ctx, 0, 0, r); ctx.stroke(); break;
+      }
+      case 'heart': heartPath(ctx, 0, 0, p.size); ctx.fillStyle = p.col; ctx.fill(); break;
+      case 'bigstar': {
+        const sc = easeOutBack(clamp(u * 3, 0, 1)) * (1 + 0.1 * Math.sin(p.t * 6));
+        ctx.rotate(p.rot); ctx.scale(sc, sc);
+        starPath(ctx, 0, 0, p.size, p.size * 0.45, 5); ctx.fillStyle = '#ffd24a'; ctx.fill();
+        ctx.lineWidth = 8; ctx.strokeStyle = '#fff3b0'; ctx.lineJoin = 'round'; ctx.stroke();
+        starPath(ctx, 0, 0, p.size * 0.5, p.size * 0.22, 5); ctx.fillStyle = '#fff3b0'; ctx.fill();
+        break;
+      }
+    }
+    ctx.restore();
+  }
+}
+
+/* ------------------------------------------------------- character art */
+function artOverride(key, c, pose) {
+  const art = window.SANTA_ART && window.SANTA_ART[key];
+  if (!art) return false;
+  if (typeof art === 'function') { art(c, pose, time); return true; }
+  if (art instanceof HTMLImageElement && art.complete && art.naturalWidth) {
+    const h = 260, w = h * art.naturalWidth / art.naturalHeight; c.drawImage(art, -w / 2, -h, w, h); return true;
+  }
+  return false;
+}
+function shadow(c, rx) { c.fillStyle = 'rgba(70,90,150,.22)'; ell(c, 0, 2, rx, 12); c.fill(); }
+function eyes(c, x, y, sp, r, blink) {
+  c.fillStyle = '#2a2233';
+  for (const d of [-1, 1]) { ell(c, x + d * sp, y, r, Math.max(1, r * (blink ? 0.15 : 1.15))); c.fill(); }
+  if (!blink) { c.fillStyle = '#fff'; for (const d of [-1, 1]) { circ(c, x + d * sp + r * 0.3, y - r * 0.4, r * 0.35); c.fill(); } }
+}
+function smile(c, x, y, w, open) {
+  if (open > 0.08) {
+    ell(c, x, y + open * 4, w * 0.5, 3 + open * 9); c.fillStyle = '#7a1f2b'; c.fill();
+    ell(c, x, y + open * 9, w * 0.3, 2 + open * 3); c.fillStyle = '#ff8a95'; c.fill();
+  } else {
+    c.strokeStyle = '#7a3a3a'; c.lineWidth = 3; c.lineCap = 'round';
+    c.beginPath(); c.moveTo(x - w / 2, y); c.quadraticCurveTo(x, y + w * 0.45, x + w / 2, y); c.stroke();
+  }
+}
+function arm(c, sx, sy, len, side, a, w, col) {
+  const ang = lerp(0.95, -1.05, a), ex = sx + side * Math.cos(ang) * len, ey = sy + Math.sin(ang) * len;
+  c.strokeStyle = col; c.lineWidth = w; c.lineCap = 'round';
+  c.beginPath(); c.moveTo(sx, sy); c.lineTo(ex, ey); c.stroke();
+  return [ex, ey];
+}
+
+function drawSnowman(c, p) {
+  shadow(c, 74);
+  const [lx, ly] = arm(c, -34, -128, 66, -1, p.arms, 8, '#7a4a24');
+  const [rx, ry] = arm(c, 34, -128, 66, 1, p.arms, 8, '#7a4a24');
+  c.lineWidth = 6; c.strokeStyle = '#7a4a24';
+  c.beginPath(); c.moveTo(lx, ly); c.lineTo(lx - 12, ly - 12); c.moveTo(rx, ry); c.lineTo(rx + 12, ry - 12); c.stroke();
+  const body = (x, y, r) => {
+    const g = c.createRadialGradient(x - r * 0.3, y - r * 0.4, r * 0.1, x, y, r);
+    g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#cfe0ff');
+    circ(c, x, y, r); c.fillStyle = g; c.fill(); c.lineWidth = 3; c.strokeStyle = '#b9ccf2'; c.stroke();
+  };
+  body(0, -54, 54); body(0, -128, 40); body(0, -190, 31);
+  c.fillStyle = '#2a2233'; for (const y of [-138, -118, -98]) { circ(c, 0, y, 5); c.fill(); }
+  // scarf
+  c.fillStyle = '#e5303f'; rr(c, -36, -168, 72, 16, 8); c.fill();
+  c.fillStyle = '#fff'; for (const x of [-24, -6, 12, 28]) c.fillRect(x, -167, 5, 14);
+  c.fillStyle = '#e5303f'; c.save(); c.translate(24, -156); c.rotate(-0.15); rr(c, 0, 0, 16, 44, 6); c.fill();
+  c.fillStyle = '#fff'; c.fillRect(0, 12, 16, 5); c.fillRect(0, 28, 16, 5); c.restore();
+  // face
+  eyes(c, 0, -198, 11, 4.5, p.blink);
+  c.fillStyle = '#ff8f2a'; c.beginPath(); c.moveTo(-5, -192); c.lineTo(26, -186); c.lineTo(-5, -180); c.closePath(); c.fill();
+  c.fillStyle = 'rgba(255,120,140,.5)'; circ(c, -20, -186, 6); c.fill(); circ(c, 20, -186, 6); c.fill();
+  if (p.mouth > 0.08) smile(c, 0, -170, 24, p.mouth);
+  else { c.fillStyle = '#2a2233'; for (let i = -2; i <= 2; i++) { circ(c, i * 6, -172 + (2 - Math.abs(i)) * -0 + Math.abs(i) * 2 * 0.8 - 2, 2.2); c.fill(); } }
+  // top hat
+  c.fillStyle = '#2f2a3c'; ell(c, 0, -216, 42, 10); c.fill();
+  rr(c, -26, -258, 52, 44, 5); c.fill();
+  c.fillStyle = '#e5303f'; c.fillRect(-26, -228, 52, 10);
+  c.fillStyle = '#2f2a3c'; ell(c, 0, -258, 26, 6); c.fill();
+}
+
+function drawReindeer(c, p) {
+  shadow(c, 80);
+  const brown = '#a8693a', dk = '#7e4a24';
+  for (const x of [-44, -16, 16, 44]) { rr(c, x - 9, -52, 18, 50, 8); c.fillStyle = brown; c.fill(); ell(c, x, -3, 11, 6); c.fillStyle = '#3a2a2a'; c.fill(); }
+  ell(c, 0, -86, 68, 46); const g = c.createLinearGradient(0, -130, 0, -40); g.addColorStop(0, '#bb7a46'); g.addColorStop(1, '#955a30');
+  c.fillStyle = g; c.fill();
+  ell(c, 0, -68, 40, 26); c.fillStyle = '#f0d3a8'; c.fill();
+  c.fillStyle = '#fff'; ell(c, 62, -100, 14, 12); c.fill();
+  // collar + bell
+  c.fillStyle = '#e5303f'; rr(c, -34, -128, 68, 14, 7); c.fill();
+  c.fillStyle = '#ffd24a'; circ(c, 0, -112, 9); c.fill(); c.strokeStyle = '#d9a000'; c.lineWidth = 2; c.stroke();
+  c.save(); c.translate(0, -166); c.rotate(p.rot * 1.6);
+  // antlers
+  c.strokeStyle = '#e2c18a'; c.lineWidth = 9; c.lineCap = 'round'; c.lineJoin = 'round';
+  const wig = Math.sin(time * 3) * 1.5;
+  for (const s of [-1, 1]) {
+    c.beginPath(); c.moveTo(s * 22, -30); c.quadraticCurveTo(s * 38, -62, s * 58 + wig, -92);
+    c.moveTo(s * 40, -56); c.lineTo(s * 24, -80); c.moveTo(s * 50, -72); c.lineTo(s * 70 + wig, -70);
+    c.moveTo(s * 58 + wig, -92); c.lineTo(s * 52, -112); c.stroke();
+  }
+  // ears
+  for (const s of [-1, 1]) {
+    c.save(); c.translate(s * 46, -10); c.rotate(s * 0.8);
+    ell(c, 0, 0, 14, 24); c.fillStyle = brown; c.fill(); ell(c, 0, 2, 7, 15); c.fillStyle = '#ffb3a8'; c.fill(); c.restore();
+  }
+  // head
+  circ(c, 0, 0, 46); c.fillStyle = '#b57440'; c.fill();
+  ell(c, 0, 20, 28, 22); c.fillStyle = '#f0cfa6'; c.fill();
+  eyes(c, 0, -6, 18, 6, p.blink);
+  c.fillStyle = 'rgba(255,120,140,.45)'; circ(c, -32, 14, 7); c.fill(); circ(c, 32, 14, 7); c.fill();
+  // glowing red nose
+  const glow = 0.55 + 0.25 * Math.sin(time * 3);
+  c.fillStyle = 'rgba(255,60,70,' + (glow * 0.45) + ')'; circ(c, 0, 14, 22); c.fill();
+  circ(c, 0, 14, 12); c.fillStyle = '#ff3b4a'; c.fill();
+  c.fillStyle = 'rgba(255,255,255,.7)'; circ(c, -4, 10, 3.5); c.fill();
+  smile(c, 0, 33, 22, p.mouth);
+  c.restore();
+}
+
+function drawElf(c, p) {
+  shadow(c, 64);
+  // legs + shoes
+  for (const s of [-1, 1]) {
+    const x = s * 20;
+    c.save(); rr(c, x - 10, -66, 20, 58, 6); c.clip();
+    c.fillStyle = '#fff'; c.fillRect(x - 12, -68, 24, 62);
+    c.fillStyle = '#e5303f'; for (let y = -66; y < -6; y += 16) c.fillRect(x - 12, y, 24, 8);
+    c.restore();
+    ell(c, x + s * 4, -8, 22, 11); c.fillStyle = '#c92b3a'; c.fill();
+    circ(c, x + s * 24, -14, 7); c.fill(); c.fillStyle = '#ffd24a'; circ(c, x + s * 26, -20, 4); c.fill();
+  }
+  // arms (behind tunic edge)
+  const [lx, ly] = arm(c, -34, -122, 52, -1, p.arms, 18, '#2fa04f');
+  const [rx, ry] = arm(c, 34, -122, 52, 1, p.arms, 18, '#2fa04f');
+  c.fillStyle = '#ffd7b8'; circ(c, lx, ly, 11); c.fill(); circ(c, rx, ry, 11); c.fill();
+  // tunic with zig-zag hem
+  c.beginPath(); c.moveTo(-40, -132); c.lineTo(40, -132); c.lineTo(52, -56);
+  for (let i = 0; i < 6; i++) c.lineTo(52 - (i + 1) * (104 / 6), i % 2 ? -56 : -42);
+  c.lineTo(-52, -56); c.closePath();
+  const tg = c.createLinearGradient(0, -132, 0, -50); tg.addColorStop(0, '#46c569'); tg.addColorStop(1, '#2d9d4b');
+  c.fillStyle = tg; c.fill(); c.lineWidth = 3; c.strokeStyle = '#237a3b'; c.stroke();
+  c.fillStyle = '#5a3418'; c.fillRect(-48, -96, 96, 12);
+  c.fillStyle = '#ffd24a'; rr(c, -11, -99, 22, 18, 3); c.fill();
+  c.fillStyle = '#e5303f'; for (const x of [-26, 26]) { circ(c, x, -114, 4); c.fill(); }
+  // ears
+  c.fillStyle = '#ffd7b8';
+  for (const s of [-1, 1]) { c.beginPath(); c.moveTo(s * 30, -176); c.lineTo(s * 62, -196); c.lineTo(s * 34, -156); c.closePath(); c.fill(); }
+  // head
+  circ(c, 0, -168, 37); c.fillStyle = '#ffd7b8'; c.fill();
+  c.fillStyle = '#8a5a2b'; for (const s of [-1, 1]) { circ(c, s * 34, -154, 9); c.fill(); }
+  eyes(c, 0, -170, 14, 5, p.blink);
+  c.fillStyle = 'rgba(255,120,140,.55)'; circ(c, -24, -156, 7); c.fill(); circ(c, 24, -156, 7); c.fill();
+  c.fillStyle = '#f7a08e'; circ(c, 0, -160, 4); c.fill();
+  smile(c, 0, -148, 22, p.mouth);
+  // hat
+  c.beginPath(); c.moveTo(-40, -192); c.bezierCurveTo(-40, -236, -4, -262, 48, -246);
+  c.bezierCurveTo(60, -240, 62, -228, 54, -222); c.bezierCurveTo(40, -214, 40, -200, 40, -192); c.closePath();
+  c.fillStyle = '#2fa04f'; c.fill(); c.lineWidth = 3; c.strokeStyle = '#237a3b'; c.stroke();
+  c.fillStyle = '#e5303f'; rr(c, -46, -202, 92, 18, 9); c.fill();
+  c.fillStyle = '#fff'; for (const x of [-30, -10, 10, 30]) { circ(c, x, -193, 3.5); c.fill(); }
+  const sw = Math.sin(time * 4 + p.t0) * 3;
+  c.fillStyle = '#ffd24a'; circ(c, 56 + sw, -214, 10); c.fill(); c.strokeStyle = '#d9a000'; c.lineWidth = 2; c.stroke();
+  c.fillStyle = '#9a6b00'; circ(c, 56 + sw, -211, 2); c.fill();
+}
+
+function helperPose(h) {
+  let dy = 0, rot = 0, sx = 1, sy = 1, arms = 0.05, mouth = 0;
+  const idle = Math.sin(time * 2.2 + h.phase);
+  sy += idle * 0.012; sx -= idle * 0.008;
+  if (h.hint > 0) { arms = 0.55 + 0.4 * Math.sin(time * 6); dy += Math.abs(Math.sin(time * 3)) * 10; mouth = 0.5; }
+  if (h.wrapT >= 0) {
+    const u = h.wrapT / WRAP;
+    rot = Math.sin(h.wrapT * 30) * 0.1 * (1 - u * 0.4);
+    sx = 1 + 0.07 * Math.sin(u * Math.PI * 4); sy = 1 - 0.07 * Math.sin(u * Math.PI * 4);
+    arms = 0.38 + 0.08 * Math.sin(h.wrapT * 40); mouth = 0.3;
+  }
+  if (h.tossT >= 0) {
+    const u = h.tossT / 0.4;
+    sy *= 1 + 0.16 * Math.sin(u * Math.PI); sx *= 1 - 0.09 * Math.sin(u * Math.PI);
+    dy += Math.sin(u * Math.PI) * 14; arms = 0.9 * (1 - u) + 0.1; mouth = 0.6;
+  }
+  if (h.cheerT >= 0) {
+    const u = h.cheerT / CHEER;
+    dy += Math.abs(Math.sin(u * Math.PI * 3)) * (1 - u * 0.6) * 48;
+    arms = 1; mouth = 1; rot = Math.sin(h.cheerT * 18) * 0.05;
+  }
+  if (h.boing > 0) { const b = h.boing; dy += Math.sin((1 - b) * Math.PI) * 20; sy *= 1 + 0.08 * b; }
+  return { dy, rot, sx, sy, arms, mouth, blink: h.blink > 0, t0: h.phase };
+}
+function drawHelper(h) {
+  const L = LANES[h.i], pose = helperPose(h);
+  ctx.save();
+  ctx.translate(L.topX, Y_TOP - 8 - pose.dy);
+  ctx.rotate(pose.rot); ctx.scale(pose.sx * 1.08, pose.sy * 1.08);
+  if (!artOverride(h.kind, ctx, pose)) {
+    if (h.kind === 'snowman') drawSnowman(ctx, pose);
+    else if (h.kind === 'reindeer') drawReindeer(ctx, pose);
+    else drawElf(ctx, pose);
+  }
+  ctx.restore();
+}
+
+/* ---------------- Santa ---------------- */
+function santaPose() {
+  const m = santa.hoT >= 0 ? Math.max(0, Math.sin((santa.hoT % 0.27) / 0.2 * Math.PI)) * (santa.hoT < santa.hoCount * 0.27 ? 1 : 0) : 0;
+  return { mouth: m, arms: santa.wave, blink: santa.blink > 0 };
+}
+function drawSantaBody(c, pose) {
+  // boots
+  c.fillStyle = '#2a2233'; ell(c, -30, -9, 30, 15); c.fill(); ell(c, 30, -9, 30, 15); c.fill();
+  // body
+  const g = c.createLinearGradient(-66, 0, 66, 0); g.addColorStop(0, '#d9222f'); g.addColorStop(0.45, '#f23c48'); g.addColorStop(1, '#c91d2b');
+  ell(c, 0, -100, 68, 80); c.fillStyle = g; c.fill(); c.lineWidth = 3; c.strokeStyle = '#a5161f'; c.stroke();
+  // fur trim and belt
+  c.fillStyle = '#fff'; rr(c, -62, -48, 124, 28, 14); c.fill(); rr(c, -9, -172, 18, 82, 9); c.fill();
+  c.fillStyle = '#2a2233'; rr(c, -66, -94, 132, 20, 4); c.fill();
+  c.fillStyle = '#ffd24a'; rr(c, -17, -98, 34, 28, 5); c.fill();
+  c.fillStyle = '#2a2233'; rr(c, -9, -91, 18, 14, 3); c.fill();
+  // left arm (waves when he laughs)
+  const [lx, ly] = arm(c, -56, -146, 60, -1, 0.05 + pose.arms * 0.8, 30, '#d9222f');
+  c.fillStyle = '#fff'; circ(c, lx, ly, 17); c.fill();
+  c.fillStyle = '#2a2233'; circ(c, lx, ly + (pose.arms > 0.5 ? -4 : 4), 14); c.fill();
+  // head
+  circ(c, 0, -198, 39); c.fillStyle = '#ffd7b8'; c.fill();
+  c.fillStyle = 'rgba(255,120,130,.5)'; circ(c, -28, -190, 8); c.fill(); circ(c, 28, -190, 8); c.fill();
+  // beard
+  c.fillStyle = '#fff'; c.strokeStyle = '#e3eaf7'; c.lineWidth = 2;
+  ell(c, 0, -170, 47, 36); c.fill(); c.stroke();
+  for (const d of [[-32, -158, 22], [32, -158, 22], [0, -144, 27], [-16, -150, 22], [16, -150, 22]]) { circ(c, d[0], d[1], d[2]); c.fill(); }
+  // mouth sits in the beard
+  const mo = pose.mouth;
+  if (mo > 0.06) { ell(c, 0, -172 + mo * 3, 13 + mo * 5, 4 + mo * 12); c.fillStyle = '#7a1f2b'; c.fill(); ell(c, 0, -166 + mo * 8, 8, 2 + mo * 4); c.fillStyle = '#ff8a95'; c.fill(); }
+  else { c.strokeStyle = '#c0707a'; c.lineWidth = 3; c.lineCap = 'round'; c.beginPath(); c.moveTo(-9, -172); c.quadraticCurveTo(0, -165, 9, -172); c.stroke(); }
+  // moustache, nose, eyes
+  c.fillStyle = '#fff'; c.strokeStyle = '#e3eaf7'; c.lineWidth = 2;
+  ell(c, -18, -184, 22, 12, -0.3); c.fill(); c.stroke(); ell(c, 18, -184, 22, 12, 0.3); c.fill(); c.stroke();
+  c.fillStyle = '#ff9a8d'; circ(c, 0, -192, 11); c.fill();
+  eyes(c, 0, -207, 15, 4.5, pose.blink);
+  c.strokeStyle = '#fff'; c.lineWidth = 4; c.lineCap = 'round';
+  c.beginPath(); c.moveTo(-23, -218); c.quadraticCurveTo(-15, -224, -8, -219); c.moveTo(23, -218); c.quadraticCurveTo(15, -224, 8, -219); c.stroke();
+  // hat
+  c.beginPath(); c.moveTo(-45, -224); c.bezierCurveTo(-50, -272, -8, -304, 36, -294);
+  c.bezierCurveTo(58, -288, 72, -272, 68, -252); c.bezierCurveTo(62, -242, 54, -234, 45, -224); c.closePath();
+  const hg = c.createLinearGradient(-40, -300, 40, -224); hg.addColorStop(0, '#f23c48'); hg.addColorStop(1, '#c91d2b');
+  c.fillStyle = hg; c.fill(); c.lineWidth = 3; c.strokeStyle = '#a5161f'; c.stroke();
+  c.fillStyle = '#fff'; rr(c, -52, -236, 104, 26, 13); c.fill();
+  const sw = Math.sin(time * 3) * 3;
+  circ(c, 68 + sw, -248, 16); c.fill();
+}
+function drawSack(c, dropP) {
+  const n = Math.min(santa.sackN, 4), k = 1 + 0.035 * n;
+  c.save(); c.translate(SACK_DX, 0); c.scale(k, k);
+  const back = () => {
+    c.beginPath(); c.moveTo(-46, -150); c.bezierCurveTo(-78, -112, -86, -40, -54, -6);
+    c.quadraticCurveTo(0, 14, 54, -6); c.bezierCurveTo(86, -40, 78, -112, 46, -150); c.closePath();
+  };
+  const grad = () => { const g = c.createLinearGradient(-80, 0, 80, 0); g.addColorStop(0, '#c98b4a'); g.addColorStop(0.5, '#e3a965'); g.addColorStop(1, '#b8793d'); return g; };
+  back(); c.fillStyle = grad(); c.fill();
+  ell(c, 0, -150, 46, 15); c.fillStyle = '#5a3418'; c.fill();
+  c.strokeStyle = '#8a5a2b'; c.lineWidth = 6; c.beginPath(); c.ellipse(0, -150, 46, 15, 0, Math.PI, TAU); c.stroke();
+  // presents peeking out of the top
+  for (const pk of santa.peek) { c.save(); c.translate(pk.dx, -150 + pk.dy); c.rotate(pk.rot); drawPresent(c, pk.spec, pk.size); c.restore(); }
+  // present dropping in
+  if (dropP) {
+    const u = smooth(dropP.dropT / DROP_DUR);
+    c.save(); c.translate(0, lerp(-178, -98, u)); c.rotate(lerp(dropP.rot, 0, u));
+    drawPresent(c, dropP.spec, lerp(80, 52, u)); c.restore();
+  }
+  // front of sack (hides anything below the lip)
+  c.beginPath(); c.moveTo(-46, -150); c.ellipse(0, -150, 46, 15, 0, Math.PI, 0, true);
+  c.bezierCurveTo(78, -112, 86, -40, 54, -6); c.quadraticCurveTo(0, 14, -54, -6);
+  c.bezierCurveTo(-86, -40, -78, -112, -46, -150); c.closePath();
+  c.fillStyle = grad(); c.fill();
+  c.strokeStyle = '#e8c48a'; c.lineWidth = 7; c.lineCap = 'round';
+  c.beginPath(); c.ellipse(0, -150, 46, 15, 0, 0.05, Math.PI - 0.05); c.stroke();
+  c.strokeStyle = 'rgba(90,52,24,.45)'; c.lineWidth = 3; c.setLineDash([7, 6]);
+  c.beginPath(); c.moveTo(-40, -118); c.quadraticCurveTo(-60, -60, -44, -20); c.stroke(); c.setLineDash([]);
+  starPath(c, 0, -72, 24, 11, 5); c.fillStyle = '#ffd24a'; c.fill(); c.lineWidth = 3; c.strokeStyle = '#d9a000'; c.stroke();
+  c.fillStyle = '#e5303f'; rr(c, -52, -142, 12, 26, 5); c.fill();   // little red tie
+  c.restore();
+}
+function santaWorld() {
+  const arc = santa.hop ? Math.sin(Math.PI * santa.hop.u) * 140 : 0;
+  return { x: santa.x, y: FEET_Y - arc - santa.jump, arc };
+}
+function drawSanta() {
+  const w = santaWorld(), pose = santaPose();
+  const drop = presents.find(p => p.state === 'drop');
+  ctx.save();
+  ctx.fillStyle = 'rgba(70,90,150,' + (0.26 * (1 - w.arc / 220)) + ')';
+  ell(ctx, w.x + 52, FEET_Y + 2, 140 * (1 - w.arc / 500), 15); ctx.fill();
+  ctx.translate(w.x, w.y);
+  ctx.rotate(santa.rot);
+  ctx.scale(1 + 0.12 * santa.squash, 1 - 0.16 * santa.squash);
+  if (!artOverride('santa', ctx, pose)) {
+    drawSantaBody(ctx, pose);
+    drawSack(ctx, drop);
+    // right hand holds the sack's rim
+    ctx.fillStyle = '#d9222f'; rr(ctx, 40, -166, 34, 28, 12); ctx.fill();
+    ctx.fillStyle = '#fff'; circ(ctx, 62, -146, 13); ctx.fill();
+    ctx.fillStyle = '#2a2233'; circ(ctx, 66, -143, 13); ctx.fill();
+  }
+  ctx.restore();
+}
+
+/* ---------------- sleigh ---------------- */
+const SLOTS = [[-78, -152], [-26, -152], [26, -152], [78, -152], [-52, -200], [0, -200], [52, -200], [-26, -248], [26, -248], [0, -296]];
+function drawSleighLocal(c, pile) {
+  if (artOverride('sleigh', c, { pile })) return;
+  for (let i = 0; i < pile.length && i < SLOTS.length; i++) {
+    c.save(); c.translate(SLOTS[i][0], SLOTS[i][1]); c.rotate(((i * 37) % 11 - 5) * 0.025); drawPresent(c, pile[i], 54); c.restore();
+  }
+  c.lineCap = 'round'; c.lineJoin = 'round';
+  c.strokeStyle = '#ffd24a'; c.lineWidth = 10;
+  c.beginPath(); c.moveTo(-170, -72); c.bezierCurveTo(-196, -10, -172, -4, -130, -4); c.lineTo(125, -4); c.bezierCurveTo(165, -4, 176, -14, 180, -36); c.stroke();
+  c.lineWidth = 7; c.beginPath(); c.moveTo(-90, -8); c.lineTo(-88, -46); c.moveTo(70, -8); c.lineTo(72, -46); c.stroke();
+  c.beginPath(); c.moveTo(-122, -44); c.lineTo(122, -44); c.quadraticCurveTo(166, -50, 166, -128); c.lineTo(-96, -128);
+  c.quadraticCurveTo(-150, -124, -160, -76); c.quadraticCurveTo(-150, -52, -122, -44); c.closePath();
+  const g = c.createLinearGradient(0, -128, 0, -44); g.addColorStop(0, '#ff4a5a'); g.addColorStop(1, '#c9202f');
+  c.fillStyle = g; c.fill(); c.lineWidth = 4; c.strokeStyle = '#9c1520'; c.stroke();
+  c.strokeStyle = '#ffd24a'; c.lineWidth = 9;
+  c.beginPath(); c.moveTo(-160, -76); c.quadraticCurveTo(-150, -124, -96, -128); c.lineTo(166, -128); c.stroke();
+  c.fillStyle = '#fff'; rr(c, -120, -60, 238, 14, 7); c.fill();
+  c.fillStyle = '#ffd24a'; for (const x of [-100, -40, 20, 80]) { starPath(c, x, -90, 11, 5, 5); c.fill(); }
+  if (CONFIG.sleighName) { c.font = 'bold 34px system-ui, sans-serif'; c.textAlign = 'center'; c.fillStyle = '#ffe27a'; c.fillText(CONFIG.sleighName, 20, -78); }
+}
+function sleighPose() {
+  if (!sleigh.flying) {
+    const b = sleigh.bounce;
+    return { x: SLEIGH_HOME.x, y: SLEIGH_HOME.y - Math.abs(Math.sin(b * 9)) * 14 * b, rot: Math.sin(b * 12) * 0.03 * b, sc: 1 };
+  }
+  const t = sleigh.flyT;
+  const q = (p0, p1, p2, u) => { const a = 1 - u; return [a * a * p0[0] + 2 * a * u * p1[0] + u * u * p2[0], a * a * p0[1] + 2 * a * u * p1[1] + u * u * p2[1]]; };
+  let pts, u;
+  if (t < 3.0) { u = smooth(t / 3.0) * 0.5 + (t / 3.0) * 0.5; pts = [[SLEIGH_HOME.x, SLEIGH_HOME.y], [900, -320], [-520, 140]]; }
+  else { u = clamp((t - 3.0) / 3.0, 0, 1); u = smooth(u) * 0.6 + u * 0.4; pts = [[2150, 170], [1750, 520], [SLEIGH_HOME.x, SLEIGH_HOME.y]]; }
+  const p = q(pts[0], pts[1], pts[2], u), p2 = q(pts[0], pts[1], pts[2], Math.min(1, u + 0.01));
+  const rot = clamp(Math.atan2(-(p2[1] - p[1]), -(p2[0] - p[0] || -0.001)), -0.55, 0.55);
+  return { x: p[0], y: p[1], rot, sc: 1 };
+}
+function drawSleigh() {
+  const sp = sleighPose();
+  ctx.save(); ctx.fillStyle = 'rgba(70,90,150,.2)';
+  if (!sleigh.flying) { ell(ctx, SLEIGH_HOME.x, SLEIGH_HOME.y + 4, 190, 16); ctx.fill(); }
+  ctx.translate(sp.x, sp.y); ctx.rotate(sp.rot);
+  drawSleighLocal(ctx, sleigh.pile);
+  ctx.restore();
+}
+
+/* ---------------- scenery ---------------- */
+function drawTree(x, y, s, seed) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+  ctx.fillStyle = '#7a4a24'; ctx.fillRect(-14, -30, 28, 34);
+  const tiers = [[-20, 150, 96], [-95, 120, 78], [-165, 92, 60]];
+  tiers.forEach((t, k) => {
+    ctx.beginPath(); ctx.moveTo(0, t[0] - t[1] * 0.7); ctx.lineTo(t[2], t[0] + 30); ctx.lineTo(-t[2], t[0] + 30); ctx.closePath();
+    ctx.fillStyle = k % 2 ? '#2f9a58' : '#27884b'; ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.moveTo(0, t[0] - t[1] * 0.7); ctx.lineTo(t[2] * 0.42, t[0] - t[1] * 0.14);
+    ctx.quadraticCurveTo(t[2] * 0.1, t[0] - t[1] * 0.02, -t[2] * 0.2, t[0] - t[1] * 0.1); ctx.lineTo(-t[2] * 0.42, t[0] - t[1] * 0.14); ctx.closePath(); ctx.fill();
+  });
+  const cols = ['#ff4d6a', '#ffd23f', '#4aa8ff', '#fff'];
+  for (let i = 0; i < 9; i++) {
+    const a = (i * 2.399 + seed) % TAU, ty = -30 - (i / 9) * 150, tx = Math.cos(a) * (60 - (i / 9) * 40);
+    ctx.globalAlpha = 0.65 + 0.35 * Math.sin(time * 2 + i + seed);
+    ctx.fillStyle = cols[i % 4]; circ(ctx, tx, ty, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  starPath(ctx, 0, -258, 20, 9, 5); ctx.fillStyle = '#ffd24a'; ctx.fill();
+  ctx.restore();
+}
+function drawBackground() {
+  screenTransform();
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#1c2a66'); g.addColorStop(0.4, '#4b62b9'); g.addColorStop(0.72, '#a9b9ee'); g.addColorStop(1, '#eaf0ff');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  gameTransform();
+  for (const s of stars) {
+    ctx.globalAlpha = 0.45 + 0.4 * Math.sin(time * 1.6 + s.ph); ctx.fillStyle = '#fff'; circ(ctx, s.x, s.y, s.r); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // moon
+  const mg = ctx.createRadialGradient(1380, 130, 20, 1380, 130, 130); mg.addColorStop(0, 'rgba(255,248,200,.55)'); mg.addColorStop(1, 'rgba(255,248,200,0)');
+  ctx.fillStyle = mg; circ(ctx, 1380, 130, 130); ctx.fill();
+  ctx.fillStyle = '#fff7c9'; circ(ctx, 1380, 130, 52); ctx.fill();
+  ctx.fillStyle = 'rgba(230,215,150,.5)'; circ(ctx, 1365, 120, 10); ctx.fill(); circ(ctx, 1394, 144, 7); ctx.fill();
+  // distant mountains
+  for (const [col, base, amp, k] of [['#8394d8', 560, 130, 230], ['#a3b3ec', 600, 90, 170]]) {
+    ctx.beginPath(); ctx.moveTo(ext.l - 60, ext.b + 20);
+    for (let x = ext.l - 60; x <= ext.r + 60; x += 20) ctx.lineTo(x, base - amp * Math.abs(Math.sin(x / k + base)) - 30 * Math.abs(Math.sin(x / 71)));
+    ctx.lineTo(ext.r + 60, ext.b + 20); ctx.closePath(); ctx.fillStyle = col; ctx.fill();
+  }
+  // the big hill the slides are carved into
+  ctx.beginPath(); ctx.moveTo(ext.l - 40, 760); ctx.lineTo(ext.l - 40, 372);
+  for (let x = ext.l - 40; x <= 1180; x += 20) ctx.lineTo(x, 372 + 16 * Math.sin(x / 85) + Math.max(0, (x - 1100)) * 0.9);
+  ctx.lineTo(1300, 720); ctx.lineTo(1300, 760); ctx.closePath();
+  const hg = ctx.createLinearGradient(0, 340, 0, 760); hg.addColorStop(0, '#fbfdff'); hg.addColorStop(1, '#d3e0ff');
+  ctx.fillStyle = hg; ctx.fill();
+  // snowy ground
+  ctx.beginPath(); ctx.moveTo(ext.l - 40, ext.b + 40);
+  for (let x = ext.l - 40; x <= ext.r + 40; x += 20) ctx.lineTo(x, 705 + 9 * Math.sin(x / 130));
+  ctx.lineTo(ext.r + 40, ext.b + 40); ctx.closePath();
+  const gg = ctx.createLinearGradient(0, 700, 0, ext.b); gg.addColorStop(0, '#ffffff'); gg.addColorStop(1, '#cfdcff');
+  ctx.fillStyle = gg; ctx.fill();
+  // trees
+  drawTree(1245, 650, 0.8, 1); drawTree(1530, 610, 0.95, 4);
+  drawTree(ext.l + 40, 640, 0.7, 2);
+}
+function drawGarland() {
+  const y0 = 30;
+  ctx.strokeStyle = '#255c36'; ctx.lineWidth = 4; ctx.beginPath();
+  const bulbs = [];
+  for (let x = ext.l - 40; x <= ext.r + 40; x += 8) {
+    const y = y0 + 34 * Math.abs(Math.sin((x - 20) / 400 * Math.PI)) * 0.9;
+    ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  const cols = ['#ff4d6a', '#ffd23f', '#4aa8ff', '#3ecf74', '#ff9a3c'];
+  let i = 0;
+  for (let x = ext.l; x <= ext.r; x += 56, i++) {
+    const y = y0 + 34 * Math.abs(Math.sin((x - 20) / 400 * Math.PI)) * 0.9 + 12;
+    const wave = garlandBoost * Math.max(0, Math.sin(i * 0.55 - time * 9));
+    const br = clamp(0.6 + 0.2 * Math.sin(time * 1.8 + i * 0.9) + wave * 0.6, 0, 1);
+    ctx.fillStyle = cols[i % 5]; ctx.globalAlpha = 0.25 * br; circ(ctx, x, y, 17 + wave * 5); ctx.fill();
+    ctx.globalAlpha = 0.55 + 0.45 * br; circ(ctx, x, y, 8); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function drawSlides() {
+  LANES.forEach((L, i) => {
+    const x0 = L.topX, x1 = L.botX;
+    ctx.beginPath(); ctx.moveTo(x0 - HW_TOP, Y_TOP); ctx.lineTo(x0 + HW_TOP, Y_TOP); ctx.lineTo(x1 + HW_BOT, Y_BOT); ctx.lineTo(x1 - HW_BOT, Y_BOT); ctx.closePath();
+    const g = ctx.createLinearGradient(0, Y_TOP, 0, Y_BOT); g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#bfe3ff');
+    ctx.fillStyle = g; ctx.fill();
+    // coloured centre stripe
+    ctx.beginPath(); ctx.moveTo(x0 - 22, Y_TOP); ctx.lineTo(x0 + 22, Y_TOP); ctx.lineTo(x1 + 34, Y_BOT); ctx.lineTo(x1 - 34, Y_BOT); ctx.closePath();
+    ctx.fillStyle = L.color; ctx.globalAlpha = 0.28; ctx.fill(); ctx.globalAlpha = 1;
+    // shiny streaks sliding down
+    ctx.lineCap = 'round';
+    for (let k = 0; k < 5; k++) {
+      const t = (time * 0.18 + k / 5 + i * 0.13) % 1, y = lerp(Y_TOP + 20, Y_BOT - 20, t), x = lerp(x0, x1, t);
+      const hw = lerp(HW_TOP, HW_BOT, t) * 0.55 * (k % 2 ? 1 : -1) * (0.4 + 0.6 * ((k * 0.37) % 1));
+      ctx.strokeStyle = 'rgba(255,255,255,' + (0.7 * Math.sin(t * Math.PI)) + ')'; ctx.lineWidth = 6;
+      ctx.beginPath(); ctx.moveTo(x + hw, y); ctx.lineTo(x + hw + (x1 - x0) * 0.04, y + 34); ctx.stroke();
+    }
+    // candy-cane rails
+    for (const s of [-1, 1]) {
+      ctx.beginPath(); ctx.moveTo(x0 + s * HW_TOP, Y_TOP); ctx.lineTo(x1 + s * HW_BOT, Y_BOT);
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 17; ctx.setLineDash([]); ctx.stroke();
+      ctx.strokeStyle = '#e5303f'; ctx.setLineDash([28, 28]); ctx.stroke(); ctx.setLineDash([]);
+    }
+    // curved lip + snow puff at the bottom
+    ell(ctx, x1, Y_BOT, HW_BOT + 6, 24); ctx.fillStyle = '#e4f2ff'; ctx.fill(); ctx.lineWidth = 5; ctx.strokeStyle = '#fff'; ctx.stroke();
+    // launch deck
+    ctx.fillStyle = L.dark; rr(ctx, x0 - 142, Y_TOP - 6, 284, 46, 20); ctx.fill();
+    ctx.fillStyle = L.color; rr(ctx, x0 - 142, Y_TOP - 14, 284, 34, 18); ctx.fill();
+    ctx.fillStyle = '#fff'; for (const dx of [-110, -60, -10, 40, 90]) { ell(ctx, x0 + dx, Y_TOP - 14, 30, 10); ctx.fill(); }
+  });
+}
+
+/* --------------------------------------------------------------- presents */
+function presentPos(p) {
+  const L = LANES[p.lane];
+  if (p.state === 'wrap') {
+    const u = clamp(p.t / WRAP, 0, 1);
+    return { x: L.topX, y: Y_TOP - 8 - 118, size: 66 * easeOutBack(clamp(u * 1.1, 0, 1)), rot: Math.sin(p.t * 16) * 0.3 * (1 - u) };
+  }
+  const yA = Y_TOP - 70, yB = MOUTH_Y - 28;
+  const e = lerp(p.p, smooth(p.p), 0.6);
+  const y = lerp(yA, yB, e), x = lerp(laneXAt(p.lane, yA), L.botX, e);
+  const bob = p.state === 'arrived' ? Math.sin(time * 9) * 3 : 0;
+  return { x, y: y + bob, size: lerp(64, 84, e), rot: Math.sin(p.age * 3.2 + p.seed) * 0.25 * (1 - e * 0.6) };
+}
+function drawPresentsOnSlides() {
+  for (const p of presents) {
+    if (p.state === 'drop') continue;
+    const q = presentPos(p);
+    if (q.size <= 1) continue;
+    ctx.fillStyle = 'rgba(60,90,150,.18)'; ell(ctx, q.x, q.y + q.size * 0.55, q.size * 0.5, q.size * 0.12); ctx.fill();
+    ctx.save(); ctx.translate(q.x, q.y); ctx.rotate(q.rot); drawPresent(ctx, p.spec, q.size); ctx.restore();
+  }
+}
+
+/* ------------------------------------------------------------ game logic */
+function tapLane(i) {
+  lastTap = time;
+  const h = helpers[i];
+  const inflight = presents.length;
+  if (h.wrapT >= 0 || h.cool > 0 || inflight >= MAX_INFLIGHT) { h.boing = 1; SND.boingSmall(); return; }
+  h.wrapT = 0; h.boing = 0; h.hint = 0;
+  const p = { lane: i, state: 'wrap', t: 0, p: 0, age: 0, dropT: 0, spec: newSpec(), seed: rand(0, 6), trail: 0, rot: 0 };
+  presents.push(p); h.current = p;
+  SND.tap(); SND.wrap();
+  const L = LANES[i];
+  sparkBurst(L.topX, Y_TOP - 120, 10, ['#ffe27a', '#fff', L.color], 200, 16, 0.8);
+}
+function launch(h) {
+  const p = h.current; if (!p || p.state !== 'wrap') return;
+  p.state = 'slide'; p.p = 0; p.age = 0;
+  SND.slide();
+  const L = LANES[h.i];
+  ringFx(L.topX, Y_TOP - 60, '#fff', 90, 0.6);
+}
+function startHop(to) {
+  santa.hop = { from: santa.x, to: santaXFor(to), lane: to, t: 0, u: 0 };
+  SND.hop();
+}
+function santaSackWorld() { const w = santaWorld(); return { x: w.x + SACK_DX, y: w.y - 150 }; }
+
+function onCatch(p) {
+  totalCaught++; lastTap = time;
+  const sk = santaSackWorld(), L = LANES[p.lane];
+  santa.squash = 1; santa.sackN++;
+  if (santa.peek.length < 4) santa.peek.push({ spec: p.spec, dx: rand(-22, 22), dy: rand(-2, 14), size: rand(38, 48), rot: rand(-0.4, 0.4) });
+  SND.catch(0.12);
+  // Santa laughs (shorter ho if he is already mid-laugh)
+  const multi = santa.hoT >= 0 && santa.hoT < santa.hoCount * 0.27 + 0.2;
+  santa.hoCount = multi ? 1 : 3; santa.hoT = 0; santa.wave = 1;
+  SND.ho(santa.hoCount);
+  sparkBurst(sk.x, sk.y, 16, [p.spec.col.base, '#ffe27a', '#fff'], 300, 18, 1);
+  ringFx(sk.x, sk.y, p.spec.col.base, 110, 0.7);
+  for (let k = 0; k < 3; k++) later(() => { const w = santaWorld(); P('spark', w.x + rand(-30, 30), w.y - 330 + rand(-10, 10), { vy: -60, life: 0.8, size: 18, col: '#ffd24a', rot: rand(0, 1), spin: 2 }); }, k * 0.27);
+  // helper cheers
+  const h = helpers[p.lane];
+  later(() => { h.cheerT = 0; SND.cheer(h.kind, 0); for (let k = 0; k < 4; k++) later(() => heartFx(L.topX + rand(-50, 50), Y_TOP - 200), k * 0.12);
+    sparkBurst(L.topX, Y_TOP - 140, 14, ['#ffe27a', '#fff', L.color], 260, 16, 0.9); }, 0.45);
+  if (totalCaught % CONFIG.presentsPerCelebration === 0) later(celebrate, 0.85);
+}
+function celebrate() {
+  SND.celebrate();
+  snowBurst(170);
+  garlandBoost = 1;
+  helpers.forEach((h, i) => later(() => { h.cheerT = 0; }, i * 0.14));
+  confettiFx(800, 420, 40);
+  P('bigstar', 800, 420, { size: 90, life: 2.2, vy: -20, rot: 0, spin: 0.6 });
+  santa.jump = 0; santa.squash = 1; santa.wave = 1;
+  // toss two presents from the sack to the sleigh
+  const sk = santaSackWorld();
+  const room = CONFIG.sleighCapacity - sleigh.pile.length - sleigh.incoming;
+  if (!sleigh.flying && room > 0) {
+    for (let k = 0; k < Math.min(2, room); k++) {
+      const slot = sleigh.pile.length + sleigh.incoming; sleigh.incoming++;
+      const sp = newSpec();
+      flyers.push({ t: -k * 0.3, dur: 1.1, from: { x: sk.x, y: sk.y }, spec: sp, slot });
+    }
+  }
+  santa.sackN = 0; santa.peek.length = 0;
+}
+function landFlyer(f) {
+  sleigh.incoming--; sleigh.pile.push(f.spec); sleigh.bounce = 1;
+  const s = SLOTS[Math.min(f.slot, SLOTS.length - 1)];
+  const x = SLEIGH_HOME.x + s[0], y = SLEIGH_HOME.y + s[1];
+  sparkBurst(x, y, 12, [f.spec.col.base, '#ffe27a', '#fff'], 240, 16, 0.9);
+  SND.sleighLand();
+  if (sleigh.pile.length >= CONFIG.sleighCapacity && !sleigh.takeoffPending && !sleigh.flying) {
+    sleigh.takeoffPending = true;
+    later(startFlight, 1.3);
+  }
+}
+function startFlight() {
+  sleigh.takeoffPending = false; sleigh.flying = true; sleigh.flyT = 0; sleigh.phaseB = false;
+  SND.takeoff();
+  helpers.forEach((h, i) => later(() => { h.cheerT = 0; }, i * 0.1));
+  santa.wave = 1; santa.hoT = 0; santa.hoCount = 3; SND.ho(3);
+}
+function sleighTap() {
+  lastTap = time; sleigh.bounce = 1; SND.sleighBells();
+  sparkBurst(SLEIGH_HOME.x, SLEIGH_HOME.y - 140, 12, ['#ffd24a', '#fff', '#ff6b8b'], 260, 16, 0.9);
+}
+function handleTap(v) {
+  P('ring', v.x, v.y, { size: 70, life: 0.5, col: 'rgba(255,255,255,.9)' });
+  sparkBurst(v.x, v.y, 5, ['#fff', '#ffe27a'], 140, 12, 0.6);
+  if (v.x > 1190 && v.y > 420) { sleighTap(); return; }
+  let best = 0, bd = 1e9;
+  for (let i = 0; i < LANES.length; i++) { const d = Math.abs(v.x - laneXAt(i, clamp(v.y, Y_TOP, Y_BOT))); if (d < bd) { bd = d; best = i; } }
+  tapLane(best);
+}
+
+function update(dt) {
+  time += dt;
+  for (let i = timers.length - 1; i >= 0; i--) { timers[i].t -= dt; if (timers[i].t <= 0) { const f = timers[i].fn; timers.splice(i, 1); f(); } }
+  garlandBoost = Math.max(0, garlandBoost - dt * 0.35);
+  if (sleigh.bounce > 0) sleigh.bounce = Math.max(0, sleigh.bounce - dt * 1.6);
+
+  // helpers
+  for (const h of helpers) {
+    if (h.wrapT >= 0) { h.wrapT += dt; if (h.wrapT >= WRAP) { h.wrapT = -1; h.tossT = 0; h.cool = 0.2; launch(h); } }
+    if (h.tossT >= 0) { h.tossT += dt; if (h.tossT > 0.4) h.tossT = -1; }
+    if (h.cheerT >= 0) { h.cheerT += dt; if (h.cheerT > CHEER) h.cheerT = -1; }
+    if (h.boing > 0) h.boing = Math.max(0, h.boing - dt * 3);
+    if (h.cool > 0) h.cool -= dt;
+    h.nextBlink -= dt; if (h.nextBlink < 0) { h.blink = 0.14; h.nextBlink = rand(2, 5); }
+    if (h.blink > 0) h.blink -= dt;
+    h.hint = (state === 'play' && presents.length === 0 && time - lastTap > 8 && ((((time - lastTap - 8) / 3) | 0) % 3) === h.i) ? 1 : 0;
+  }
+
+  // presents
+  for (const p of presents) {
+    p.age += dt;
+    if (p.state === 'wrap') p.t += dt;
+    else if (p.state === 'slide') {
+      p.p += dt / SLIDE_DUR;
+      p.trail -= dt;
+      if (p.trail <= 0) { p.trail = 0.07; const q = presentPos(p); P('spark', q.x + rand(-14, 14), q.y + q.size * 0.4, { vy: 30, life: 0.5, size: rand(7, 12), col: pick(['#fff', LANES[p.lane].color, '#ffe27a']), rot: rand(0, 3), spin: 3 }); }
+      if (p.p >= 1) { p.p = 1; p.state = 'arrived'; }
+    } else if (p.state === 'drop') {
+      p.dropT += dt;
+    }
+  }
+  for (let i = presents.length - 1; i >= 0; i--) if (presents[i].state === 'drop' && presents[i].dropT >= DROP_DUR) presents.splice(i, 1);
+
+  // Santa: always goes to the lane of the next present, and always catches it
+  santa.busy = Math.max(0, santa.busy - dt);
+  const head = presents.find(p => p.state !== 'drop');
+  if (santa.hop) {
+    const hp = santa.hop; hp.t += dt; hp.u = clamp(hp.t / HOP_DUR, 0, 1);
+    santa.x = lerp(hp.from, hp.to, smooth(hp.u));
+    santa.rot = clamp((hp.to - hp.from) / 1800, -0.25, 0.25) * Math.sin(Math.PI * hp.u);
+    if (hp.u >= 1) { santa.lane = hp.lane; santa.hop = null; santa.rot = 0; santa.squash = Math.max(santa.squash, 0.7); SND.land(); }
+  } else {
+    santa.rot = Math.sin(time * 1.8) * 0.018;
+    if (head && santa.busy <= 0) {
+      if (head.lane !== santa.lane) startHop(head.lane);
+      else if (head.state === 'arrived') { head.state = 'drop'; head.dropT = 0; head.rot = presentPos({ ...head, state: 'arrived' }).rot; santa.busy = 0.4; onCatch(head); }
+    }
+  }
+  santa.squash = Math.max(0, santa.squash - dt * 3.2);
+  santa.jump = Math.max(0, santa.jump - dt * 200);
+  if (santa.hoT >= 0) { santa.hoT += dt; if (santa.hoT > santa.hoCount * 0.27 + 0.3) { santa.hoT = -1; } }
+  santa.wave = Math.max(0, santa.wave - dt * 0.9);
+  santa.nextBlink -= dt; if (santa.nextBlink < 0) { santa.blink = 0.14; santa.nextBlink = rand(2, 5); }
+  if (santa.blink > 0) santa.blink -= dt;
+
+  // flyers (presents tossed to the sleigh)
+  for (let i = flyers.length - 1; i >= 0; i--) {
+    const f = flyers[i]; f.t += dt;
+    if (f.t >= f.dur) { landFlyer(f); flyers.splice(i, 1); }
+  }
+  // sleigh flight
+  if (sleigh.flying) {
+    sleigh.flyT += dt; sleigh.bellT -= dt;
+    const sp = sleighPose();
+    if (sleigh.bellT <= 0) { sleigh.bellT = 0.05; P('spark', sp.x + rand(-50, 110), sp.y - rand(20, 80), { vx: rand(-20, 60), vy: rand(10, 50), life: 0.9, size: rand(10, 18), col: pick(['#ffd24a', '#fff', '#ff9ac8', '#8ff0ff']), rot: rand(0, 3), spin: 3 }); }
+    if (sleigh.flyT >= 3.0 && !sleigh.phaseB) { sleigh.phaseB = true; sleigh.pile.length = 0; }
+    if (sleigh.flyT >= 6.0) { sleigh.flying = false; sleigh.bounce = 1; SND.sleighLand(); sparkBurst(SLEIGH_HOME.x, SLEIGH_HOME.y - 80, 20, ['#ffd24a', '#fff', '#ff9ac8'], 300, 18, 1.1); }
+  }
+
+  // ambient snow
+  for (const f of flakes) { f.y += f.v * dt; f.ph += dt; if (f.y > 1.05) { f.y = -0.05; f.x = Math.random(); } }
+  updateParticles(dt);
+}
+
+/* ---------------------------------------------------------------- render */
+function drawFlyers() {
+  for (const f of flyers) {
+    if (f.t < 0) continue;
+    const u = clamp(f.t / f.dur, 0, 1), s = SLOTS[Math.min(f.slot, SLOTS.length - 1)];
+    const tx = SLEIGH_HOME.x + s[0], ty = SLEIGH_HOME.y + s[1];
+    const x = lerp(f.from.x, tx, smooth(u)), y = lerp(f.from.y, ty, smooth(u)) - Math.sin(Math.PI * u) * 240;
+    ctx.save(); ctx.translate(x, y); ctx.rotate(u * 6); drawPresent(ctx, f.spec, lerp(60, 54, u)); ctx.restore();
+    if (Math.random() < 0.5) P('spark', x, y, { life: 0.5, size: 10, col: pick(['#ffd24a', '#fff']), rot: rand(0, 3), spin: 3 });
+  }
+}
+function drawAmbientSnow() {
+  screenTransform(); ctx.fillStyle = 'rgba(255,255,255,.85)';
+  for (const f of flakes) { circ(ctx, (f.x + Math.sin(f.ph) * 0.01) * W, f.y * H, f.r); ctx.fill(); }
+  gameTransform();
+}
+function drawHint() {
+  for (const h of helpers) if (h.hint) {
+    const L = LANES[h.i], u = (time * 1.2) % 1;
+    ctx.strokeStyle = L.color; ctx.lineWidth = 8 * (1 - u) + 1; ctx.globalAlpha = 1 - u;
+    circ(ctx, L.topX, Y_TOP - 130, 70 + u * 90); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+}
+function drawTitle() {
+  screenTransform(); ctx.fillStyle = 'rgba(20,30,90,.4)'; ctx.fillRect(0, 0, W, H); gameTransform();
+  const pulse = 1 + 0.06 * Math.sin(time * 3.2), cx = 800, cy = 450;
+  ctx.save(); ctx.translate(cx, cy + Math.sin(time * 2) * 6); ctx.scale(pulse, pulse);
+  for (let i = 0; i < 8; i++) {
+    const a = time * 0.8 + i * TAU / 8;
+    starPath(ctx, Math.cos(a) * 190, Math.sin(a) * 190, 22, 9, 5, a); ctx.fillStyle = i % 2 ? '#ffd24a' : '#fff'; ctx.fill();
+  }
+  circ(ctx, 0, 0, 135); ctx.fillStyle = '#e5303f'; ctx.fill(); ctx.lineWidth = 16; ctx.strokeStyle = '#ffd24a'; ctx.stroke();
+  ctx.fillStyle = '#fff'; ctx.lineJoin = 'round'; ctx.lineWidth = 14; ctx.strokeStyle = '#fff';
+  ctx.beginPath(); ctx.moveTo(-40, -62); ctx.lineTo(66, 0); ctx.lineTo(-40, 62); ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+function drawParentHold() {
+  if (!hold) return;
+  const el = performance.now() - hold.t0;
+  if (el < 350) return;
+  screenTransform();
+  const r = 42, cx = 62, cy = 62, u = clamp(el / CONFIG.parentHoldMs, 0, 1);
+  ctx.strokeStyle = 'rgba(255,255,255,.75)'; ctx.lineWidth = 8; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + TAU * u); ctx.stroke();
+  gameTransform();
+}
+function drawRotateHint() {
+  if (H <= W * 1.05) return;
+  screenTransform();
+  const cx = W / 2, cy = H * 0.2; ctx.save(); ctx.translate(cx, cy); ctx.rotate(Math.sin(time * 2) * 0.35);
+  ctx.fillStyle = 'rgba(255,255,255,.92)'; rr(ctx, -34, -56, 68, 112, 12); ctx.fill();
+  ctx.fillStyle = '#4b62b9'; rr(ctx, -27, -46, 54, 86, 5); ctx.fill(); ctx.restore();
+  gameTransform();
+}
+function render() {
+  drawBackground();
+  drawGarland();
+  drawSlides();
+  drawHint();
+  for (const h of helpers) drawHelper(h);
+  drawPresentsOnSlides();
+  drawSanta();
+  drawSleigh();
+  drawFlyers();
+  drawParticles();
+  drawAmbientSnow();
+  if (state === 'title') drawTitle();
+  drawParentHold();
+  drawRotateHint();
+}
+
+/* ------------------------------------------------------------ input etc. */
+const panel = document.getElementById('parent');
+let hold = null;
+const CORNER = 130;
+let wakeLock = null;
+async function getWake() { try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {} }
+function releaseWake() { try { if (wakeLock) wakeLock.release(); } catch (e) {} wakeLock = null; }
+function goFull() {
+  const el = document.documentElement;
+  try { const p = (el.requestFullscreen || el.webkitRequestFullscreen || function () {}).call(el); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+  try { if (screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(() => {}); } catch (e) {}
+}
+function leaveFull() {
+  try { if (document.fullscreenElement || document.webkitFullscreenElement) (document.exitFullscreen || document.webkitExitFullscreen).call(document); } catch (e) {}
+}
+function startGame() {
+  A.init(); A.resume();
+  state = 'play'; lastTap = time;
+  Music.start();
+  SND.fanfare();
+  santa.hoT = 0; santa.hoCount = 3; santa.wave = 1; santa.squash = 1;
+  confettiFx(800, 450, 50);
+  helpers.forEach((h, i) => later(() => { h.cheerT = 0; }, 0.4 + i * 0.12));
+  goFull(); getWake();
+}
+function resetGame() {
+  presents.length = 0; flyers.length = 0; timers.length = 0; particles.length = 0;
+  helpers.forEach(h => { h.wrapT = h.tossT = h.cheerT = -1; h.cool = 0; h.boing = 0; h.current = null; });
+  santa.lane = 1; santa.x = santaXFor(1); santa.hop = null; santa.sackN = 0; santa.peek.length = 0; santa.hoT = -1; santa.busy = 0;
+  sleigh.pile.length = 0; sleigh.incoming = 0; sleigh.flying = false; sleigh.takeoffPending = false;
+  totalCaught = 0;
+}
+function openParent() {
+  hold = null; paused = true; if (A.ctx) A.ctx.suspend();
+  document.getElementById('pMusic').textContent = 'Music: ' + (A.musicOn ? 'on' : 'off');
+  document.getElementById('pSound').textContent = 'Sound effects: ' + (A.sfxOn ? 'on' : 'off');
+  panel.hidden = false;
+}
+function closeParent() { panel.hidden = true; paused = false; last = performance.now(); if (A.ctx && state === 'play') A.ctx.resume(); }
+function savePrefs() { try { localStorage.setItem('santaSlidePrefs', JSON.stringify({ m: A.musicOn, s: A.sfxOn })); } catch (e) {} }
+try { const pr = JSON.parse(localStorage.getItem('santaSlidePrefs') || 'null'); if (pr) { A.musicOn = pr.m !== false; A.sfxOn = pr.s !== false; } } catch (e) {}
+
+document.getElementById('pResume').onclick = closeParent;
+document.getElementById('pMusic').onclick = () => { A.setMusic(!A.musicOn); if (!A.ctx) A.musicOn = !A.musicOn; savePrefs(); document.getElementById('pMusic').textContent = 'Music: ' + (A.musicOn ? 'on' : 'off'); };
+document.getElementById('pSound').onclick = () => { A.setSfx(!A.sfxOn); if (!A.ctx) A.sfxOn = !A.sfxOn; savePrefs(); document.getElementById('pSound').textContent = 'Sound effects: ' + (A.sfxOn ? 'on' : 'off'); };
+document.getElementById('pFull').onclick = () => { if (document.fullscreenElement || document.webkitFullscreenElement) leaveFull(); else goFull(); };
+document.getElementById('pExit').onclick = () => { Music.stop(); leaveFull(); releaseWake(); resetGame(); state = 'title'; closeParent(); if (A.ctx) A.ctx.suspend(); };
+
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  if (paused) return;
+  if (e.clientX < CORNER && e.clientY < CORNER) { hold = { id: e.pointerId, t0: performance.now() }; return; }
+  if (state === 'title') { startGame(); return; }
+  A.resume();
+  handleTap(toVirtual(e.clientX, e.clientY));
+}, { passive: false });
+const endHold = e => { if (hold && hold.id === e.pointerId) hold = null; };
+cv.addEventListener('pointerup', endHold);
+cv.addEventListener('pointercancel', endHold);
+cv.addEventListener('pointermove', e => { if (hold && hold.id === e.pointerId && (e.clientX > CORNER + 30 || e.clientY > CORNER + 30)) hold = null; });
+['gesturestart', 'gesturechange', 'contextmenu', 'dblclick'].forEach(n => document.addEventListener(n, e => e.preventDefault()));
+document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+window.addEventListener('keydown', e => {
+  if (e.key >= '1' && e.key <= '3') { if (state === 'title') startGame(); else tapLane(parseInt(e.key, 10) - 1); }
+  if (e.key === ' ' && state === 'title') startGame();
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { if (A.ctx) A.ctx.suspend(); }
+  else { if (A.ctx && state === 'play' && !paused) A.ctx.resume(); if (state === 'play') getWake(); last = performance.now(); }
+});
+
+/* ------------------------------------------------------------------ loop */
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (hold && performance.now() - hold.t0 >= CONFIG.parentHoldMs) openParent();
+  if (!paused) update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// exposed for testing / future tinkering
+window.__santa = { tapLane, state: () => ({ state, totalCaught, presents: presents.length, pile: sleigh.pile.length, flying: sleigh.flying, particles: particles.length }),
+  CONFIG, startGame, SND, A, celebrate };
+})();
+</script>
+</body>
+</html>
